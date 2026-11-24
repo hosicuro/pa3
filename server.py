@@ -23,10 +23,18 @@ def server():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', serverPort))
     peers = {}      # id -> {'public': (ip, port), 'private': (ip, port), 'last': monotonic 시각}
-    lock = threading.Lock()     # 4단계에서 시간초과 검사 스레드와 공유
+    lock = threading.Lock()         # peers 보호 (수신 루프 <-> timeout_checker)
+    stop = threading.Event()
 
     def send(msg, addr):
-        sock.sendto(json.dumps(msg).encode(), addr)
+        try:
+            sock.sendto(json.dumps(msg).encode(), addr)
+        except OSError:
+            pass
+
+    def notify_leave(pid, reason, targets):
+        for addr in targets:
+            send({'type': 'leave', 'id': pid, 'reason': reason}, addr)
 
     # TODO 1, 2: 등록 저장 -> 새 클라이언트에 전체 목록, 기존 클라이언트에 가입 알림
     def handle_register(msg, addr):
@@ -46,6 +54,43 @@ def server():
             for o in others:
                 send({'type': 'join', 'peer': entry}, o)
 
+    # TODO 4 (앞부분): keepalive -> 마지막 수신 시각 갱신
+    def handle_keepalive(msg, addr):
+        with lock:
+            p = peers.get(msg.get('id'))
+            if p is not None:
+                p['last'] = time.monotonic()
+
+    # TODO 3: 정상 탈퇴 -> 출력, 삭제, 남은 클라이언트에 알림
+    def handle_deregister(msg, addr):
+        pid = msg.get('id')
+        with lock:
+            p = peers.pop(pid, None)
+            others = [q['public'] for q in peers.values()]
+        if p is None:
+            return
+        print('{} is deregistered {}'.format(pid, fmt(p['public'])), flush=True)
+        notify_leave(pid, 'exit', others)
+
+    # TODO 4: 1초마다 검사, 마지막 등록/keepalive 후 30초 초과 -> 출력, 삭제, 알림
+    def timeout_checker():
+        while not stop.wait(CHECK_INTERVAL_SEC):
+            now = time.monotonic()
+            with lock:
+                expired = [(pid, p['public']) for pid, p in peers.items()
+                           if now - p['last'] > TIMEOUT_SEC]
+                for pid, _ in expired:
+                    del peers[pid]
+                others = [q['public'] for q in peers.values()]
+            for pid, public in expired:
+                print('{} is disappeared {}'.format(pid, fmt(public)), flush=True)
+                notify_leave(pid, 'timeout', others)
+
+    handlers = {'register': handle_register,
+                'keepalive': handle_keepalive,
+                'deregister': handle_deregister}
+
+    threading.Thread(target=timeout_checker, daemon=True).start()
     print('server listening on port {}'.format(serverPort), flush=True)
     try:
         while True:
@@ -54,11 +99,13 @@ def server():
                 msg = json.loads(data.decode())
             except ValueError:
                 continue                    # 형식이 맞지 않는 패킷은 무시
-            if msg.get('type') == 'register':
-                handle_register(msg, addr)
+            handler = handlers.get(msg.get('type'))
+            if handler:
+                handler(msg, addr)
     except KeyboardInterrupt:
         print('server stopped', flush=True)
     finally:
+        stop.set()
         sock.close()
 
 

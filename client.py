@@ -103,7 +103,18 @@ def client(serverIP, serverPort, clientID):
                     for e in msg['peers']:
                         store(e)
 
-    threading.Thread(target=receiver, daemon=True).start()
+    # ---- TODO 3: 10초마다 같은 소켓으로 keepalive (NAT 매핑 유지도 겸함) ----
+    def keepalive():
+        while not stop.wait(KEEPALIVE_SEC):         # 10초 대기, 종료 신호가 오면 즉시 깨어남
+            try:
+                send_json(sock, {'type': 'keepalive', 'id': clientID}, server_addr)
+            except OSError:
+                break
+
+    t_recv = threading.Thread(target=receiver, daemon=True)
+    t_keep = threading.Thread(target=keepalive, daemon=True)
+    t_recv.start()
+    t_keep.start()
 
     # ---- TODO 4: 사용자 명령 ----
     try:
@@ -129,13 +140,22 @@ def client(serverIP, serverPort, clientID):
                 send_json(sock, {'type': 'chat', 'from': clientID, 'msg': text}, addr)
                 print('(sent to {} via {} address)'.format(fmt(addr), kind), flush=True)
             elif line == '@exit':
-                break                               # 4단계: 탈퇴 요청 + 정리
+                break
             else:
                 print('commands: @show_list | @chat <ID> <message> | @exit', flush=True)
     except (KeyboardInterrupt, EOFError):
         pass
+
+    # ---- TODO 6: 탈퇴 요청 -> 스레드 종료 대기 -> 소켓 정리 -> 종료 ----
+    try:
+        send_json(sock, {'type': 'deregister', 'id': clientID}, server_addr)
+    except OSError:
+        pass
     stop.set()
+    t_recv.join()           # 수신 스레드는 1초 timeout마다 stop을 확인하므로 최대 약 1초
+    t_keep.join()           # stop.wait()가 즉시 깨어남
     sock.close()
+    print('bye', flush=True)
 
 
 if __name__ == '__main__':
